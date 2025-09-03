@@ -1,8 +1,10 @@
-# Cell-atlas-of-human-fetal-cochlea
+# Cell-atlas-of-human-prenatal-hearing-organ
 code to reproduce analyses in the manuscript
 
 ## Contents
-In the present study, we conducted single-nucleus RNA sequencing (snRNA-seq) of the human fetal cochlea across the second trimester, integrating these findings with publicly available single-cell datasets from fetal weeks 7 to 9 and gestational weeks of 15 to 17, respectively. This comprehensive approach enabled us to establish a transcriptomic landscape of the human fetal cochlea and to elucidate lineage trajectories throughout human development.
+In the present study, we generated a single-cell/nucleus transcriptomic atlas of the human prenatal
+cochlea across the first and second trimesters, incorporating 82,533 cells/nuclei including
+public datasets from late first- and early second-trimester stages.
 (codes that produced in an individual figures including main figure and sm figure are dependently packaged in one file)
 
 
