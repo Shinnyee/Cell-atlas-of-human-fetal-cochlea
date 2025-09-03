@@ -1,4 +1,4 @@
-# 
+# 加载R包
 rm(list = ls())
 library(Seurat)
 library(dplyr)
@@ -304,17 +304,21 @@ p3=plot_cells(cds,
 p3
 saveRDS(cds,file = "human_orgn_MONOCLE3.rds")
 saveRDS(sce2,file = "all_human_orgn_new.rds")
-
-
+all_human_orgn_new <- readRDS("F:/PROJECTS/PROJECT_HUMAN_FETAL_COCHLEAE/WORKPLACE/R/HUMAN_ORGANOIDS/all_human_orgn_new.rds")
+sce2=all_human_orgn_new
 ###TRANSFER TO H5AD
+# 删除 SCT assay
+sce2[["SCT"]] <- NULL
 
+# 确认只剩 RNA assay
+Assays(sce2)  # 应显示 "RNA"
 library(sceasy)
 library(reticulate)
 use_condaenv('EnvironmentName')
 
 DefaultAssay(sce2) <- "RNA"
 sceasy::convertFormat(sce2, from="seurat", to="anndata",
-                      outFile='Hu_organoids_python.h5ad')
+                      outFile='Hu_organoids_python_v2.h5ad')
 
 
 
