@@ -533,3 +533,633 @@ for (i in unique(gene_group$Cluster)) {
   }
 }
 head(allcluster_go[,c("ID","Description","qvalue","cluster")])
+###################################################################################
+####################################################################################
+# 批次效应分析函数
+batch_effect_analysis <- function(seurat_obj, heatmap_genes, batch_var = "sample") {
+  
+  # 提取表达矩阵和元数据
+  expr_matrix <- GetAssayData(seurat_obj, assay = "SCT", slot = "data")
+  metadata <- seurat_obj@meta.data
+  
+  # 确保批次变量存在
+  if (!batch_var %in% colnames(metadata)) {
+    stop(paste("Batch variable", batch_var, "not found in metadata"))
+  }
+  
+  # 过滤热图基因中实际存在的基因
+  valid_genes <- intersect(heatmap_genes, rownames(expr_matrix))
+  cat("Analyzing", length(valid_genes), "genes out of", length(heatmap_genes), "provided genes\n")
+  
+  # 初始化结果数据框
+  batch_effect_results <- data.frame(
+    gene = valid_genes,
+    p_value = NA,
+    adj_p_value = NA,
+    significant = FALSE,
+    stringsAsFactors = FALSE
+  )
+  
+  # 对每个基因进行批次效应检验
+  for (i in seq_along(valid_genes)) {
+    gene <- valid_genes[i]
+    
+    # 提取基因表达量
+    gene_expr <- as.numeric(expr_matrix[gene, ])
+    
+    # 构建数据框
+    test_df <- data.frame(
+      expression = gene_expr,
+      batch = metadata[[batch_var]]
+    )
+    
+    # 使用Kruskal-Wallis检验（非参数ANOVA）
+    if (length(unique(test_df$batch)) > 1) {
+      kw_test <- kruskal.test(expression ~ batch, data = test_df)
+      batch_effect_results$p_value[i] <- kw_test$p.value
+    }
+    
+    # 进度显示
+    if (i %% 100 == 0) {
+      cat("Processed", i, "genes...\n")
+    }
+  }
+  
+  # 多重检验校正
+  batch_effect_results$adj_p_value <- p.adjust(batch_effect_results$p_value, method = "BH")
+  batch_effect_results$significant <- batch_effect_results$adj_p_value < 0.05
+  
+  return(batch_effect_results)
+}
+
+# 对于inner轨迹分析（对应图2e）
+inner_heatmap_genes <- read.csv("human_coe_inner_by_state_qval_e2_10clusters_v2.csv")
+inner_batch_results <- batch_effect_analysis(sce_monocle2, inner_heatmap_genes$gene, batch_var = "sample")
+
+
+# 结果汇总
+summarize_batch_effects <- function(results, analysis_name) {
+  total_genes <- nrow(results)
+  significant_genes <- sum(results$significant, na.rm = TRUE)
+  percentage <- round(significant_genes / total_genes * 100, 2)
+  
+  cat(analysis_name, "分析结果:\n")
+  cat("总基因数:", total_genes, "\n")
+  cat("受批次显著影响的基因数:", significant_genes, "\n")
+  cat("比例:", percentage, "%\n")
+  
+  # 检查关键基因是否受批次影响
+  key_genes <- c("ADAMTSL1", "FOXG1", "HEY2", "NOTCH1", "FGF10", "EYA1",
+                 
+                 "NRCAM", "GATA3", "TBX2", "RORB", "LFNG", "HES1",
+                 "HES5", "LGR5", "FGF20", "NR2F1", "MEIS2", "SOX2",
+                 "JAG2", "ATOH1", "SIX1", "GFI1", "SLC17A8", "POU4F3",
+                 "OTOF", "TMC1", "DLL1"
+                 
+                 )
+  key_gene_results <- results[results$gene %in% key_genes, ]
+  
+  cat("\n关键基因批次效应分析:\n")
+  print(key_gene_results[, c("gene", "adj_p_value", "significant")])
+  
+  return(list(
+    total_genes = total_genes,
+    batch_affected = significant_genes,
+    percentage = percentage,
+    key_gene_results = key_gene_results
+  ))
+}
+
+# 生成汇总报告
+inner_summary <- summarize_batch_effects(inner_batch_results, "Inner轨迹（图2e）")
+
+# 可视化结果
+library(ggplot2)
+library(patchwork)
+
+# 创建批次效应可视化
+plot_batch_summary <- function(inner_summary) {
+  summary_df <- data.frame(
+    Analysis = c("Inner Trajectory"),
+    Total_Genes = c(inner_summary$total_genes),
+    Batch_Affected = c(inner_summary$batch_affected),
+    Percentage = c(inner_summary$percentage)
+  )
+  
+  p1 <- ggplot(summary_df, aes(x = Analysis, y = Percentage, fill = Analysis)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = paste0(Percentage, "%")), vjust = -0.5) +
+    labs(title = "批次效应基因比例",
+         y = "受批次影响基因比例 (%)") +
+    theme_minimal() +
+    scale_fill_brewer(palette = "Set2")
+  
+  p2 <- ggplot(summary_df, aes(x = Analysis, y = Batch_Affected, fill = Analysis)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = Batch_Affected), vjust = -0.5) +
+    labs(title = "受批次影响基因数量",
+         y = "基因数量") +
+    theme_minimal() +
+    scale_fill_brewer(palette = "Set2")
+  
+  return(p1 + p2)
+}
+
+batch_plot <- plot_batch_summary(inner_summary)
+print(batch_plot)
+
+# 最终统计报告
+cat("\n=== 最终批次效应分析报告 ===\n")
+cat("Inner轨迹（图2e）:", inner_summary$batch_affected, "/", inner_summary$total_genes, 
+    "(", inner_summary$percentage, "%) 基因受批次显著影响\n")
+
+########################################################################################
+
+# 改进的批次效应分析 - 使用更严格的阈值和方法
+refined_batch_effect_analysis <- function(seurat_obj, heatmap_genes, batch_var = "sample") {
+  
+  # 提取表达矩阵和元数据
+  expr_matrix <- GetAssayData(seurat_obj, assay = "RNA", slot = "data")
+  metadata <- seurat_obj@meta.data
+  
+  # 过滤热图基因中实际存在的基因
+  valid_genes <- intersect(heatmap_genes, rownames(expr_matrix))
+  cat("Analyzing", length(valid_genes), "genes for batch effects\n")
+  
+  # 初始化结果数据框
+  batch_effect_results <- data.frame(
+    gene = valid_genes,
+    p_value = NA,
+    adj_p_value = NA,
+    effect_size = NA,  # 添加效应大小
+    mean_expr = NA,    # 平均表达量
+    significant_strict = FALSE,  # 严格标准
+    significant_liberal = FALSE, # 宽松标准
+    stringsAsFactors = FALSE
+  )
+  
+  # 对每个基因进行批次效应检验
+  for (i in seq_along(valid_genes)) {
+    gene <- valid_genes[i]
+    
+    tryCatch({
+      # 提取基因表达量
+      gene_expr <- as.numeric(expr_matrix[gene, ])
+      
+      # 构建数据框
+      test_df <- data.frame(
+        expression = gene_expr,
+        batch = metadata[[batch_var]]
+      )
+      
+      # 移除NA值
+      test_df <- test_df[complete.cases(test_df), ]
+      
+      # 计算平均表达量
+      batch_effect_results$mean_expr[i] <- mean(gene_expr, na.rm = TRUE)
+      
+      # 使用Kruskal-Wallis检验
+      if (length(unique(test_df$batch)) > 1 && length(test_df$expression) > 0) {
+        kw_test <- kruskal.test(expression ~ batch, data = test_df)
+        batch_effect_results$p_value[i] <- kw_test$p.value
+        
+        # 计算效应大小 (epsilon-squared)
+        n <- nrow(test_df)
+        h_stat <- kw_test$statistic
+        epsilon_squared <- (h_stat - (length(unique(test_df$batch)) - 1)) / (n - 1)
+        batch_effect_results$effect_size[i] <- epsilon_squared
+      }
+      
+    }, error = function(e) {
+      # 静默处理错误
+    })
+  }
+  
+  # 多重检验校正 - 使用更严格的标准
+  valid_p_values <- !is.na(batch_effect_results$p_value)
+  if (sum(valid_p_values) > 0) {
+    batch_effect_results$adj_p_value[valid_p_values] <- p.adjust(
+      batch_effect_results$p_value[valid_p_values], method = "BH"
+    )
+    
+    # 严格标准: FDR < 0.01 且 效应大小 > 0.1
+    batch_effect_results$significant_strict[valid_p_values] <- 
+      batch_effect_results$adj_p_value[valid_p_values] < 0.01 & 
+      batch_effect_results$effect_size[valid_p_values] > 0.1
+    
+    # 宽松标准: FDR < 0.05
+    batch_effect_results$significant_liberal[valid_p_values] <- 
+      batch_effect_results$adj_p_value[valid_p_values] < 0.05
+  }
+  
+  return(batch_effect_results)
+}
+
+# 应用改进的分析方法
+cat("=== 应用改进的批次效应分析 ===\n")
+inner_batch_refined <- refined_batch_effect_analysis(sce_monocle2, inner_heatmap_genes$gene, batch_var = "sample")
+
+# 改进的结果汇总函数
+summarize_refined_batch_effects <- function(results, analysis_name) {
+  total_genes <- nrow(results)
+  significant_strict <- sum(results$significant_strict, na.rm = TRUE)
+  significant_liberal <- sum(results$significant_liberal, na.rm = TRUE)
+  
+  percentage_strict <- round(significant_strict / total_genes * 100, 2)
+  percentage_liberal <- round(significant_liberal / total_genes * 100, 2)
+  
+  cat(analysis_name, "分析结果:\n")
+  cat("总基因数:", total_genes, "\n")
+  cat("严格标准 (FDR < 0.01 & 效应大小 > 0.1):", significant_strict, "(", percentage_strict, "%)\n")
+  cat("宽松标准 (FDR < 0.05):", significant_liberal, "(", percentage_liberal, "%)\n")
+  
+  # 检查关键基因
+  key_genes <- c("ATOH1", "SOX2", "NOTCH1", "LGR5", "TBX2", "IKZF2", 
+                 "FGF20", "HES1", "HES5", "LFNG", "NR2F1")
+  key_gene_results <- results[results$gene %in% key_genes, ]
+  
+  cat("\n关键基因批次效应分析:\n")
+  if (nrow(key_gene_results) > 0) {
+    print(key_gene_results[, c("gene", "adj_p_value", "effect_size", "significant_strict", "significant_liberal")])
+  } else {
+    cat("未找到指定的关键基因\n")
+  }
+  
+  return(list(
+    total_genes = total_genes,
+    batch_affected_strict = significant_strict,
+    batch_affected_liberal = significant_liberal,
+    percentage_strict = percentage_strict,
+    percentage_liberal = percentage_liberal,
+    key_gene_results = key_gene_results
+  ))
+}
+
+# 生成改进的汇总报告
+inner_refined_summary <- summarize_refined_batch_effects(inner_batch_refined, "Inner轨迹（图2e）")
+
+
+
+# 可视化效应大小分布
+library(ggplot2)
+
+# 创建效应大小分布图
+plot_effect_size_distribution <- function(results, analysis_name) {
+  ggplot(results[!is.na(results$effect_size), ], aes(x = effect_size)) +
+    geom_histogram(bins = 50, fill = "lightblue", color = "black") +
+    geom_vline(xintercept = 0.1, linetype = "dashed", color = "red") +
+    labs(title = paste(analysis_name, "- 批次效应大小分布"),
+         x = "效应大小 (epsilon-squared)",
+         y = "基因数量") +
+    theme_minimal()
+}
+
+effect_plot <- plot_effect_size_distribution(inner_batch_refined, "Inner轨迹")
+print(effect_plot)
+
+# 保存详细结果
+write.csv(inner_batch_refined, "inner_trajectory_batch_effect_refined_analysis.csv", row.names = FALSE)
+
+# 提取真正受批次影响的基因（严格标准）
+strong_batch_genes <- inner_batch_refined$gene[inner_batch_refined$significant_strict]
+cat("\n强烈受批次影响的基因 (严格标准):", length(strong_batch_genes), "\n")
+if (length(strong_batch_genes) > 0) {
+  cat("前20个基因:", head(strong_batch_genes, 20), "\n")
+}
+
+# 最终报告
+cat("\n=== 最终改进的批次效应分析报告 ===\n")
+cat("使用严格标准 (FDR < 0.01 & 效应大小 > 0.1):\n")
+cat("Inner轨迹:", inner_refined_summary$batch_affected_strict, "/", 
+    inner_refined_summary$total_genes, "(", inner_refined_summary$percentage_strict, "%) 基因受批次显著影响\n")
+
+cat("\n使用宽松标准 (FDR < 0.05):\n")
+cat("Inner轨迹:", inner_refined_summary$batch_affected_liberal, "/", 
+    inner_refined_summary$total_genes, "(", inner_refined_summary$percentage_liberal, "%) 基因受批次显著影响\n")
+####################################################################################
+# 扩展的多阈值批次效应分析
+extended_multi_threshold_batch_analysis <- function(seurat_obj, heatmap_genes, batch_var = "sample") {
+  
+  # 提取表达矩阵和元数据
+  expr_matrix <- GetAssayData(seurat_obj, assay = "RNA", slot = "data")
+  metadata <- seurat_obj@meta.data
+  
+  # 过滤热图基因中实际存在的基因
+  valid_genes <- intersect(heatmap_genes, rownames(expr_matrix))
+  cat("Analyzing", length(valid_genes), "genes for batch effects\n")
+  
+  # 初始化结果数据框 - 添加更多效应大小阈值
+  batch_effect_results <- data.frame(
+    gene = valid_genes,
+    p_value = NA,
+    adj_p_value = NA,
+    effect_size = NA,
+    mean_expr = NA,
+    
+    # 多个效应大小阈值
+    significant_effect_0_5 = FALSE,  # FDR < 0.05 & effect > 0.5 (很强)
+    significant_effect_0_4 = FALSE,  # FDR < 0.05 & effect > 0.4
+    significant_effect_0_3 = FALSE,  # FDR < 0.05 & effect > 0.3
+    significant_effect_0_25 = FALSE, # FDR < 0.05 & effect > 0.25
+    significant_effect_0_2 = FALSE,  # FDR < 0.05 & effect > 0.2
+    significant_effect_0_15 = FALSE, # FDR < 0.05 & effect > 0.15
+    significant_effect_0_1 = FALSE,  # FDR < 0.05 & effect > 0.1
+    significant_effect_0_05 = FALSE, # FDR < 0.05 & effect > 0.05
+    significant_fdr_only = FALSE,    # FDR < 0.05 (无效应大小要求)
+    significant_pval_only = FALSE,   # pval < 0.05
+    
+    stringsAsFactors = FALSE
+  )
+  
+  # 对每个基因进行批次效应检验
+  for (i in seq_along(valid_genes)) {
+    gene <- valid_genes[i]
+    
+    tryCatch({
+      # 提取基因表达量
+      gene_expr <- as.numeric(expr_matrix[gene, ])
+      
+      # 构建数据框
+      test_df <- data.frame(
+        expression = gene_expr,
+        batch = metadata[[batch_var]]
+      )
+      
+      # 移除NA值
+      test_df <- test_df[complete.cases(test_df), ]
+      
+      # 计算平均表达量
+      batch_effect_results$mean_expr[i] <- mean(gene_expr, na.rm = TRUE)
+      
+      # 使用Kruskal-Wallis检验
+      if (length(unique(test_df$batch)) > 1 && length(test_df$expression) > 0) {
+        kw_test <- kruskal.test(expression ~ batch, data = test_df)
+        batch_effect_results$p_value[i] <- kw_test$p.value
+        
+        # 计算效应大小 (epsilon-squared)
+        n <- nrow(test_df)
+        h_stat <- kw_test$statistic
+        epsilon_squared <- (h_stat - (length(unique(test_df$batch)) - 1)) / (n - 1)
+        batch_effect_results$effect_size[i] <- epsilon_squared
+        
+        # p-value only threshold
+        batch_effect_results$significant_pval_only[i] <- kw_test$p.value < 0.05
+      }
+      
+    }, error = function(e) {
+      # 静默处理错误
+    })
+  }
+  
+  # 多重检验校正
+  valid_p_values <- !is.na(batch_effect_results$p_value)
+  if (sum(valid_p_values) > 0) {
+    batch_effect_results$adj_p_value[valid_p_values] <- p.adjust(
+      batch_effect_results$p_value[valid_p_values], method = "BH"
+    )
+    
+    # 多个效应大小阈值标准
+    batch_effect_results$significant_effect_0_5[valid_p_values] <- 
+      batch_effect_results$adj_p_value[valid_p_values] < 0.05 & 
+      batch_effect_results$effect_size[valid_p_values] > 0.5
+    
+    batch_effect_results$significant_effect_0_4[valid_p_values] <- 
+      batch_effect_results$adj_p_value[valid_p_values] < 0.05 & 
+      batch_effect_results$effect_size[valid_p_values] > 0.4
+    
+    batch_effect_results$significant_effect_0_3[valid_p_values] <- 
+      batch_effect_results$adj_p_value[valid_p_values] < 0.05 & 
+      batch_effect_results$effect_size[valid_p_values] > 0.3
+    
+    batch_effect_results$significant_effect_0_25[valid_p_values] <- 
+      batch_effect_results$adj_p_value[valid_p_values] < 0.05 & 
+      batch_effect_results$effect_size[valid_p_values] > 0.25
+    
+    batch_effect_results$significant_effect_0_2[valid_p_values] <- 
+      batch_effect_results$adj_p_value[valid_p_values] < 0.05 & 
+      batch_effect_results$effect_size[valid_p_values] > 0.2
+    
+    batch_effect_results$significant_effect_0_15[valid_p_values] <- 
+      batch_effect_results$adj_p_value[valid_p_values] < 0.05 & 
+      batch_effect_results$effect_size[valid_p_values] > 0.15
+    
+    batch_effect_results$significant_effect_0_1[valid_p_values] <- 
+      batch_effect_results$adj_p_value[valid_p_values] < 0.05 & 
+      batch_effect_results$effect_size[valid_p_values] > 0.1
+    
+    batch_effect_results$significant_effect_0_05[valid_p_values] <- 
+      batch_effect_results$adj_p_value[valid_p_values] < 0.05 & 
+      batch_effect_results$effect_size[valid_p_values] > 0.05
+    
+    batch_effect_results$significant_fdr_only[valid_p_values] <- 
+      batch_effect_results$adj_p_value[valid_p_values] < 0.05
+  }
+  
+  return(batch_effect_results)
+}
+
+# 应用扩展的多阈值分析
+cat("=== 扩展的多阈值批次效应分析 ===\n")
+inner_batch_extended <- extended_multi_threshold_batch_analysis(sce_monocle2, inner_heatmap_genes$gene, batch_var = "sample")
+
+# 扩展的多阈值结果汇总函数
+summarize_extended_batch_effects <- function(results, analysis_name) {
+  total_genes <- nrow(results)
+  
+  # 计算各个阈值的显著基因数
+  counts <- list(
+    effect_0_5 = sum(results$significant_effect_0_5, na.rm = TRUE),
+    effect_0_4 = sum(results$significant_effect_0_4, na.rm = TRUE),
+    effect_0_3 = sum(results$significant_effect_0_3, na.rm = TRUE),
+    effect_0_25 = sum(results$significant_effect_0_25, na.rm = TRUE),
+    effect_0_2 = sum(results$significant_effect_0_2, na.rm = TRUE),
+    effect_0_15 = sum(results$significant_effect_0_15, na.rm = TRUE),
+    effect_0_1 = sum(results$significant_effect_0_1, na.rm = TRUE),
+    effect_0_05 = sum(results$significant_effect_0_05, na.rm = TRUE),
+    fdr_only = sum(results$significant_fdr_only, na.rm = TRUE),
+    pval_only = sum(results$significant_pval_only, na.rm = TRUE)
+  )
+  
+  percentages <- lapply(counts, function(x) round(x / total_genes * 100, 2))
+  
+  cat(analysis_name, "扩展多阈值分析结果:\n")
+  cat("总基因数:", total_genes, "\n\n")
+  
+  cat("效应大小阈值分析 (FDR < 0.05):\n")
+  cat("1. 效应大小 > 0.5 (极强):", counts$effect_0_5, "(", percentages$effect_0_5, "%)\n")
+  cat("2. 效应大小 > 0.4 (很强):", counts$effect_0_4, "(", percentages$effect_0_4, "%)\n")
+  cat("3. 效应大小 > 0.3 (强):", counts$effect_0_3, "(", percentages$effect_0_3, "%)\n")
+  cat("4. 效应大小 > 0.25 (中强):", counts$effect_0_25, "(", percentages$effect_0_25, "%)\n")
+  cat("5. 效应大小 > 0.2 (中等):", counts$effect_0_2, "(", percentages$effect_0_2, "%)\n")
+  cat("6. 效应大小 > 0.15 (中弱):", counts$effect_0_15, "(", percentages$effect_0_15, "%)\n")
+  cat("7. 效应大小 > 0.1 (弱):", counts$effect_0_1, "(", percentages$effect_0_1, "%)\n")
+  cat("8. 效应大小 > 0.05 (很弱):", counts$effect_0_05, "(", percentages$effect_0_05, "%)\n\n")
+  
+  cat("无效应大小要求:\n")
+  cat("9. 仅FDR < 0.05:", counts$fdr_only, "(", percentages$fdr_only, "%)\n")
+  cat("10. 仅pval < 0.05:", counts$pval_only, "(", percentages$pval_only, "%)\n")
+  
+  # 检查关键基因
+  key_genes <- c("ATOH1", "SOX2", "NOTCH1", "LGR5", "TBX2", "IKZF2", 
+                 "FGF20", "HES1", "HES5", "LFNG", "NR2F1")
+  key_gene_results <- results[results$gene %in% key_genes, ]
+  
+  cat("\n关键基因在不同效应大小阈值下的批次效应:\n")
+  if (nrow(key_gene_results) > 0) {
+    key_summary <- key_gene_results[, c("gene", "adj_p_value", "effect_size")]
+    
+    # 添加各个阈值的结果
+    thresholds <- c("0.5", "0.4", "0.3", "0.25", "0.2", "0.15", "0.1", "0.05")
+    for(thresh in thresholds) {
+      col_name <- paste0("significant_effect_", gsub("\\.", "_", thresh))
+      key_summary[[paste0("effect_>", thresh)]] <- key_gene_results[[col_name]]
+    }
+    
+    print(key_summary)
+  } else {
+    cat("未找到指定的关键基因\n")
+  }
+  
+  return(list(
+    total_genes = total_genes,
+    counts = counts,
+    percentages = percentages,
+    key_gene_results = key_gene_results
+  ))
+}
+
+# 生成扩展的汇总报告
+inner_extended_summary <- summarize_extended_batch_effects(inner_batch_extended, "Inner轨迹（图2e）")
+
+# 创建效应大小阈值比较可视化
+plot_effect_threshold_comparison <- function(results, analysis_name) {
+  threshold_data <- data.frame(
+    Effect_Threshold = c(">0.5", ">0.4", ">0.3", ">0.25", ">0.2", ">0.15", ">0.1", ">0.05", "FDR only", "pval only"),
+    Genes_Affected = c(
+      sum(results$significant_effect_0_5, na.rm = TRUE),
+      sum(results$significant_effect_0_4, na.rm = TRUE),
+      sum(results$significant_effect_0_3, na.rm = TRUE),
+      sum(results$significant_effect_0_25, na.rm = TRUE),
+      sum(results$significant_effect_0_2, na.rm = TRUE),
+      sum(results$significant_effect_0_15, na.rm = TRUE),
+      sum(results$significant_effect_0_1, na.rm = TRUE),
+      sum(results$significant_effect_0_05, na.rm = TRUE),
+      sum(results$significant_fdr_only, na.rm = TRUE),
+      sum(results$significant_pval_only, na.rm = TRUE)
+    ),
+    Percentage = c(
+      round(sum(results$significant_effect_0_5, na.rm = TRUE)/nrow(results)*100, 1),
+      round(sum(results$significant_effect_0_4, na.rm = TRUE)/nrow(results)*100, 1),
+      round(sum(results$significant_effect_0_3, na.rm = TRUE)/nrow(results)*100, 1),
+      round(sum(results$significant_effect_0_25, na.rm = TRUE)/nrow(results)*100, 1),
+      round(sum(results$significant_effect_0_2, na.rm = TRUE)/nrow(results)*100, 1),
+      round(sum(results$significant_effect_0_15, na.rm = TRUE)/nrow(results)*100, 1),
+      round(sum(results$significant_effect_0_1, na.rm = TRUE)/nrow(results)*100, 1),
+      round(sum(results$significant_effect_0_05, na.rm = TRUE)/nrow(results)*100, 1),
+      round(sum(results$significant_fdr_only, na.rm = TRUE)/nrow(results)*100, 1),
+      round(sum(results$significant_pval_only, na.rm = TRUE)/nrow(results)*100, 1)
+    )
+  )
+  
+  threshold_data$Effect_Threshold <- factor(threshold_data$Effect_Threshold, 
+                                            levels = threshold_data$Effect_Threshold)
+  
+  ggplot(threshold_data, aes(x = Effect_Threshold, y = Percentage, fill = Effect_Threshold)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = paste0(Percentage, "%")), vjust = -0.5, size = 2.5) +
+    labs(title = paste(analysis_name, "- 不同效应大小阈值下的批次效应"),
+         y = "受批次影响基因比例 (%)",
+         x = "效应大小阈值 (FDR < 0.05)") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none") +
+    scale_fill_brewer(palette = "Spectral")
+}
+
+effect_threshold_plot <- plot_effect_threshold_comparison(inner_batch_extended, "Inner轨迹")
+print(effect_threshold_plot)
+
+# 保存扩展结果
+write.csv(inner_batch_extended, "inner_trajectory_batch_effect_extended_thresholds.csv", row.names = FALSE)
+
+# 最终详细报告
+cat("\n" + rep("=", 80) + "\n")
+cat("                        扩展多阈值批次效应分析最终报告\n")
+cat(rep("=", 80) + "\n\n")
+
+cat("基于您要求的特定阈值:\n")
+cat("• FDR < 0.05 & 效应大小 > 0.25:", inner_extended_summary$counts$effect_0_25, "/", 
+    inner_extended_summary$total_genes, "(", inner_extended_summary$percentages$effect_0_25, "%)\n")
+cat("• FDR < 0.05 & 效应大小 > 0.2:", inner_extended_summary$counts$effect_0_2, "/", 
+    inner_extended_summary$total_genes, "(", inner_extended_summary$percentages$effect_0_2, "%)\n")
+cat("• FDR < 0.05 & 效应大小 > 0.5:", inner_extended_summary$counts$effect_0_5, "/", 
+    inner_extended_summary$total_genes, "(", inner_extended_summary$percentages$effect_0_5, "%)\n\n")
+
+cat("效应大小解释 (epsilon-squared):\n")
+cat("• > 0.5: 极强效应 - 批次解释了 >50% 的表达变异\n")
+cat("• 0.3-0.5: 强效应 - 批次解释了 30-50% 的表达变异\n")
+cat("• 0.1-0.3: 中等效应 - 批次解释了 10-30% 的表达变异\n")
+cat("• < 0.1: 弱效应 - 批次解释了 <10% 的表达变异\n\n")
+
+# 检查核心基因在您关注的阈值下的状态
+cat("核心基因在关键阈值下的状态:\n")
+thresholds_to_check <- c("0.25", "0.2", "0.5")
+if (nrow(inner_extended_summary$key_gene_results) > 0) {
+  for (thresh in thresholds_to_check) {
+    cat("\n在 FDR<0.05 & 效应大小 >", thresh, "标准下:\n")
+    col_name <- paste0("significant_effect_", gsub("\\.", "_", thresh))
+    
+    affected_genes <- inner_extended_summary$key_gene_results$gene[inner_extended_summary$key_gene_results[[col_name]]]
+    unaffected_genes <- inner_extended_summary$key_gene_results$gene[!inner_extended_summary$key_gene_results[[col_name]]]
+    
+    if (length(affected_genes) > 0) {
+      cat("  受影响: ", paste(affected_genes, collapse = ", "), "\n")
+    }
+    if (length(unaffected_genes) > 0) {
+      cat("  不受影响: ", paste(unaffected_genes, collapse = ", "), "\n")
+    }
+  }
+}
+
+# 创建审稿人回复用的简洁表格
+create_final_reviewer_table <- function(extended_summary) {
+  final_table <- data.frame(
+    Threshold = c(
+      "FDR<0.05 & Effect>0.5",
+      "FDR<0.05 & Effect>0.4", 
+      "FDR<0.05 & Effect>0.3",
+      "FDR<0.05 & Effect>0.25",
+      "FDR<0.05 & Effect>0.2",
+      "FDR<0.05 & Effect>0.1",
+      "FDR<0.05 only"
+    ),
+    Genes_Affected = c(
+      paste0(extended_summary$counts$effect_0_5, "/", extended_summary$total_genes),
+      paste0(extended_summary$counts$effect_0_4, "/", extended_summary$total_genes),
+      paste0(extended_summary$counts$effect_0_3, "/", extended_summary$total_genes),
+      paste0(extended_summary$counts$effect_0_25, "/", extended_summary$total_genes),
+      paste0(extended_summary$counts$effect_0_2, "/", extended_summary$total_genes),
+      paste0(extended_summary$counts$effect_0_1, "/", extended_summary$total_genes),
+      paste0(extended_summary$counts$fdr_only, "/", extended_summary$total_genes)
+    ),
+    Percentage = c(
+      paste0(extended_summary$percentages$effect_0_5, "%"),
+      paste0(extended_summary$percentages$effect_0_4, "%"),
+      paste0(extended_summary$percentages$effect_0_3, "%"),
+      paste0(extended_summary$percentages$effect_0_25, "%"),
+      paste0(extended_summary$percentages$effect_0_2, "%"),
+      paste0(extended_summary$percentages$effect_0_1, "%"),
+      paste0(extended_summary$percentages$fdr_only, "%")
+    ),
+    Effect_Strength = c("Very Strong", "Strong", "Moderate-Strong", "Moderate", 
+                        "Moderate-Weak", "Weak", "Statistical only")
+  )
+  
+  return(final_table)
+}
+
+reviewer_final_table <- create_final_reviewer_table(inner_extended_summary)
+print(reviewer_final_table)
+write.csv(reviewer_final_table, "batch_effect_final_summary_for_reviewers_inner.csv", row.names = FALSE)
+
+######################################################################################
